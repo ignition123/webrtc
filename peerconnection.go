@@ -782,6 +782,8 @@ func (pc *PeerConnection) SetRemoteDescription(desc SessionDescription) error {
 				return fmt.Errorf("RemoteDescription contained media section without mid value")
 			}
 
+			hasRids := len(getRids(media)) > 0
+
 			if media.MediaName.Media == mediaSectionApplication {
 				continue
 			}
@@ -803,6 +805,13 @@ func (pc *PeerConnection) SetRemoteDescription(desc SessionDescription) error {
 				}
 				t = pc.newRTPTransceiver(receiver, nil, RTPTransceiverDirectionRecvonly, kind)
 			}
+
+			// mark the receiver as useRid here and not when calling Receiver.Receive in startRTP since it's executed
+			// asynchronously and could start after the remote has received our answer and started sending rtp/rtcp packets
+			if hasRids {
+				t.Receiver().useRid = true
+			}
+
 			if t.Mid() == "" {
 				_ = t.setMid(midValue)
 			}
@@ -874,10 +883,18 @@ func (pc *PeerConnection) SetRemoteDescription(desc SessionDescription) error {
 }
 
 func (pc *PeerConnection) startReceiver(incoming trackDetails, receiver *RTPReceiver) {
+	encodings := []RTPDecodingParameters{}
+	if incoming.useRid {
+		for _, rid := range incoming.rids {
+			encodings = append(encodings, RTPDecodingParameters{RTPCodingParameters{RID: rid}})
+		}
+	} else {
+		encodings = append(encodings, RTPDecodingParameters{RTPCodingParameters{SSRC: incoming.ssrc}})
+	}
+
 	err := receiver.Receive(RTPReceiveParameters{
-		Encodings: RTPDecodingParameters{
-			RTPCodingParameters{SSRC: incoming.ssrc},
-		}})
+		Encodings: encodings,
+	})
 	if err != nil {
 		pc.log.Warnf("RTPReceiver Receive failed %s", err)
 		return
@@ -919,7 +936,7 @@ func (pc *PeerConnection) startReceiver(incoming trackDetails, receiver *RTPRece
 }
 
 // startRTPReceivers opens knows inbound SRTP streams from the RemoteDescription
-func (pc *PeerConnection) startRTPReceivers(incomingTracks map[uint32]trackDetails, currentTransceivers []*RTPTransceiver) {
+func (pc *PeerConnection) startRTPReceivers(incomingTracks map[string]trackDetails, currentTransceivers []*RTPTransceiver) {
 	localTransceivers := append([]*RTPTransceiver{}, currentTransceivers...)
 
 	remoteIsPlanB := false

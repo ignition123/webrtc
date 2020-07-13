@@ -11,18 +11,29 @@ import (
 	"github.com/pion/srtp"
 )
 
+const defaultRid = "default-rid"
+
 // RTPReceiver allows an application to inspect the receipt of a Track
 type RTPReceiver struct {
 	kind      RTPCodecType
 	transport *DTLSTransport
 
-	track *Track
+	track  *Track
+	tracks map[string]*Track
 
-	closed, received chan interface{}
-	mu               sync.RWMutex
+	closed, initialized chan interface{}
+	mu                  sync.RWMutex
 
 	rtpReadStream  *srtp.ReadStreamSRTP
 	rtcpReadStream *srtp.ReadStreamSRTCP
+
+	rids   map[string]string
+	useRid bool
+
+	rtpReadStreams       map[string]*srtp.ReadStreamSRTP
+	rtcpReadStreams      map[string]*srtp.ReadStreamSRTCP
+	rtpReadStreamsReady  map[string]chan struct{}
+	rtcpReadStreamsReady map[string]chan struct{}
 
 	// A reference to the associated api object
 	api *API
@@ -35,11 +46,11 @@ func (api *API) NewRTPReceiver(kind RTPCodecType, transport *DTLSTransport) (*RT
 	}
 
 	return &RTPReceiver{
-		kind:      kind,
-		transport: transport,
-		api:       api,
-		closed:    make(chan interface{}),
-		received:  make(chan interface{}),
+		kind:        kind,
+		transport:   transport,
+		api:         api,
+		closed:      make(chan interface{}),
+		initialized: make(chan interface{}),
 	}, nil
 }
 
@@ -63,36 +74,48 @@ func (r *RTPReceiver) Receive(parameters RTPReceiveParameters) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	select {
-	case <-r.received:
+	case <-r.initialized:
 		return fmt.Errorf("Receive has already been called")
 	default:
 	}
-	defer close(r.received)
+	defer close(r.initialized)
+
+	r.rtpReadStreams = make(map[string]*srtp.ReadStreamSRTP)
+	r.rtcpReadStreams = make(map[string]*srtp.ReadStreamSRTCP)
+	r.rtpReadStreamsReady = make(map[string]chan struct{})
+	r.rtcpReadStreamsReady = make(map[string]chan struct{})
+
+	simulcast := len(r.rids) > 0
 
 	r.track = &Track{
 		kind:     r.kind,
-		ssrc:     parameters.Encodings.SSRC,
+		ssrc:     parameters.Encodings[0].SSRC,
 		receiver: r,
 	}
 
-	srtpSession, err := r.transport.getSRTPSession()
-	if err != nil {
-		return err
-	}
+	if !simulcast {
+		srtpSession, err := r.transport.getSRTPSession()
+		if err != nil {
+			return err
+		}
 
-	r.rtpReadStream, err = srtpSession.OpenReadStream(parameters.Encodings.SSRC)
-	if err != nil {
-		return err
-	}
+		r.rtpReadStreams[defaultRid], err = srtpSession.OpenReadStream(parameters.Encodings[0].SSRC)
+		if err != nil {
+			return err
+		}
 
-	srtcpSession, err := r.transport.getSRTCPSession()
-	if err != nil {
-		return err
-	}
+		srtcpSession, err := r.transport.getSRTCPSession()
+		if err != nil {
+			return err
+		}
 
-	r.rtcpReadStream, err = srtcpSession.OpenReadStream(parameters.Encodings.SSRC)
-	if err != nil {
-		return err
+		r.rtcpReadStreams[defaultRid], err = srtcpSession.OpenReadStream(parameters.Encodings[0].SSRC)
+		if err != nil {
+			return err
+		}
+
+		close(r.rtpReadStreamsReady[defaultRid])
+		close(r.rtcpReadStreamsReady[defaultRid])
 	}
 
 	return nil
@@ -101,11 +124,17 @@ func (r *RTPReceiver) Receive(parameters RTPReceiveParameters) error {
 // Read reads incoming RTCP for this RTPReceiver
 func (r *RTPReceiver) Read(b []byte) (n int, err error) {
 	select {
-	case <-r.received:
+	case <-r.initialized:
 		return r.rtcpReadStream.Read(b)
 	case <-r.closed:
 		return 0, io.ErrClosedPipe
 	}
+}
+
+// ReadStreamID reads incoming RTCP for this RTPReceiver
+func (r *RTPReceiver) ReadStreamID(b []byte, streamID string) (n int, err error) {
+	<-r.rtpReadStreamsReady[streamID]
+	return r.rtpReadStreams[streamID].Read(b)
 }
 
 // ReadRTCP is a convenience method that wraps Read and unmarshals for you
@@ -119,9 +148,22 @@ func (r *RTPReceiver) ReadRTCP() ([]rtcp.Packet, error) {
 	return rtcp.Unmarshal(b[:i])
 }
 
+// ReadRTCPStreamID is a convenience method that wraps Read and unmarshals for you
+func (r *RTPReceiver) ReadRTCPStreamID(streamID string) ([]rtcp.Packet, error) {
+	<-r.rtpReadStreamsReady[streamID]
+
+	b := make([]byte, receiveMTU)
+	i, err := r.rtcpReadStreams[streamID].Read(b)
+	if err != nil {
+		return nil, err
+	}
+
+	return rtcp.Unmarshal(b[:i])
+}
+
 func (r *RTPReceiver) haveReceived() bool {
 	select {
-	case <-r.received:
+	case <-r.initialized:
 		return true
 	default:
 		return false
@@ -139,19 +181,20 @@ func (r *RTPReceiver) Stop() error {
 	default:
 	}
 
-	select {
-	case <-r.received:
-		if r.rtcpReadStream != nil {
-			if err := r.rtcpReadStream.Close(); err != nil {
+	for _, s := range r.rtpReadStreams {
+		if s != nil {
+			if err := s.Close(); err != nil {
 				return err
 			}
 		}
-		if r.rtpReadStream != nil {
-			if err := r.rtpReadStream.Close(); err != nil {
+	}
+
+	for _, s := range r.rtcpReadStreams {
+		if s != nil {
+			if err := s.Close(); err != nil {
 				return err
 			}
 		}
-	default:
 	}
 
 	close(r.closed)
@@ -160,6 +203,6 @@ func (r *RTPReceiver) Stop() error {
 
 // readRTP should only be called by a track, this only exists so we can keep state in one place
 func (r *RTPReceiver) readRTP(b []byte) (n int, err error) {
-	<-r.received
+	<-r.initialized
 	return r.rtpReadStream.Read(b)
 }

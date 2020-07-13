@@ -13,11 +13,13 @@ import (
 )
 
 type trackDetails struct {
-	mid   string
-	kind  RTPCodecType
-	label string
-	id    string
-	ssrc  uint32
+	mid    string
+	kind   RTPCodecType
+	label  string
+	id     string
+	ssrc   uint32
+	useRid bool
+	rids   []string
 }
 
 // SDPSectionType specifies media type sections
@@ -31,8 +33,8 @@ const (
 )
 
 // extract all trackDetails from an SDP.
-func trackDetailsFromSDP(log logging.LeveledLogger, s *sdp.SessionDescription) map[uint32]trackDetails {
-	incomingTracks := map[uint32]trackDetails{}
+func trackDetailsFromSDP(log logging.LeveledLogger, s *sdp.SessionDescription) map[string]trackDetails {
+	incomingTracks := map[string]trackDetails{}
 	rtxRepairFlows := map[uint32]bool{}
 
 	for _, media := range s.MediaDescriptions {
@@ -58,6 +60,14 @@ func trackDetailsFromSDP(log logging.LeveledLogger, s *sdp.SessionDescription) m
 		}
 
 		for _, attr := range media.Attributes {
+			var ssrc uint32
+			var midValue string
+
+			midValue = getMidValue(media)
+			if midValue == "" {
+				continue
+			}
+
 			switch attr.Key {
 			case sdp.AttrKeySSRCGroup:
 				split := strings.Split(attr.Value, " ")
@@ -78,7 +88,7 @@ func trackDetailsFromSDP(log logging.LeveledLogger, s *sdp.SessionDescription) m
 							continue
 						}
 						rtxRepairFlows[uint32(rtxRepairFlow)] = true
-						delete(incomingTracks, uint32(rtxRepairFlow)) // Remove if rtx was added as track before
+						delete(incomingTracks, string(rtxRepairFlow)) // Remove if rtx was added as track before
 					}
 				}
 
@@ -94,15 +104,16 @@ func trackDetailsFromSDP(log logging.LeveledLogger, s *sdp.SessionDescription) m
 
 			case sdp.AttrKeySSRC:
 				split := strings.Split(attr.Value, " ")
-				ssrc, err := strconv.ParseUint(split[0], 10, 32)
+				ssrcI, err := strconv.ParseUint(split[0], 10, 32)
 				if err != nil {
 					log.Warnf("Failed to parse SSRC: %v", err)
 					continue
 				}
-				if rtxRepairFlow := rtxRepairFlows[uint32(ssrc)]; rtxRepairFlow {
+				ssrc = uint32(ssrcI)
+				if rtxRepairFlow := rtxRepairFlows[ssrc]; rtxRepairFlow {
 					continue // This ssrc is a RTX repair flow, ignore
 				}
-				if existingValues, ok := incomingTracks[uint32(ssrc)]; ok && existingValues.label != "" && existingValues.id != "" {
+				if existingValues, ok := incomingTracks[ssrc]; ok && existingValues.label != "" && existingValues.id != "" {
 					continue // This ssrc is already fully defined
 				}
 
@@ -113,13 +124,26 @@ func trackDetailsFromSDP(log logging.LeveledLogger, s *sdp.SessionDescription) m
 
 				// Plan B might send multiple a=ssrc lines under a single m= section. This is also why a single trackDetails{}
 				// is not defined at the top of the loop over s.MediaDescriptions.
-				incomingTracks[uint32(ssrc)] = trackDetails{
-					mid:   midValue,
-					kind:  codecType,
-					label: trackLabel,
-					id:    trackID,
-					ssrc:  uint32(ssrc),
-				}
+			}
+
+			rids := getRids(media)
+			ridKeys := make([]string, 0, len(rids))
+			for k := range rids {
+				ridKeys = append(ridKeys, k)
+			}
+
+			// TODO don't add if neither RID nor SSRC
+			if midValue == "" && len(ridKeys) == 0 {
+				continue
+			}
+
+			incomingTracks[midValue] = trackDetails{
+				mid:   midValue,
+				kind:  codecType,
+				label: trackLabel,
+				id:    trackID,
+				ssrc:  ssrc,
+				rids:  ridKeys,
 			}
 		}
 	}
